@@ -604,6 +604,7 @@ def validate_sql():
         return jsonify({"error": "Request body must include 'sql' field."}), 400
 
     sql_text = body["sql"].strip()
+    sql_text = sql_text.replace('\\_', '_').replace('\\', '')
     allowed_tables = body.get("allowedTables", [])
 
     if not sql_text:
