@@ -129,11 +129,8 @@ def require_api_key(f):
 # ---------------------------------------------------------------------------
 def extract_keywords(query: str) -> list[str]:
     """Extract meaningful keywords from a natural language query."""
-    # Lowercase and split on non-alphanumeric
     tokens = re.split(r"[^a-zA-Z0-9_]+", query.lower())
-    # Remove stop words and short tokens
     keywords = [t for t in tokens if t and t not in STOP_WORDS and len(t) > 1]
-    # Expand synonyms
     expanded = set(keywords)
     for kw in keywords:
         if kw in SYNONYMS:
@@ -154,8 +151,6 @@ def search_tables(db, keywords: list[str]) -> list[dict]:
     if not keywords:
         return []
 
-    # Separate entity keywords (likely table identifiers) from attribute keywords
-    # Attribute keywords are too generic for table discovery but useful for column boosting
     ATTRIBUTE_WORDS = {
         "amount", "date", "status", "name", "number", "code", "type",
         "description", "id", "flag", "value", "total", "quantity", "price",
@@ -165,7 +160,6 @@ def search_tables(db, keywords: list[str]) -> list[dict]:
     entity_keywords = [kw for kw in keywords if kw not in ATTRIBUTE_WORDS]
     attribute_keywords = [kw for kw in keywords if kw in ATTRIBUTE_WORDS]
 
-    # If ALL keywords are attributes, use them all for table search anyway
     search_keywords = entity_keywords if entity_keywords else keywords
 
     # ---------------------------------------------------------------
@@ -204,19 +198,16 @@ def search_tables(db, keywords: list[str]) -> list[dict]:
         # Count how many ENTITY keywords match (relevance indicator)
         entity_matches = 0
         for kw in search_keywords:
-            # Table name exact substring match (highest weight)
             if kw in table_name_lower:
                 score += 15
                 entity_matches += 1
-            # User-friendly name match
             if kw in user_name_lower:
                 score += 8
                 entity_matches += 1
-            # Description match
             if kw in desc_lower:
                 score += 3
 
-        # Bonus for matching MULTIPLE entity keywords (cross-concept relevance)
+        # Bonus for matching MULTIPLE entity keywords
         if entity_matches >= 2:
             score += entity_matches * 5
 
@@ -229,10 +220,14 @@ def search_tables(db, keywords: list[str]) -> list[dict]:
             score += 2
 
         # Penalize staging, temp, backup, and interface tables
-        for suffix in ["_gt", "_int", "_stage", "_stg", "_tmp", "_temp", "_bkp",
-                        "_log", "_purge", "_arch", "_hist"]:
+        # Penalty is -50 so these always drop below 0 and get filtered out
+        TEMP_SUFFIXES = ["_gt", "_int", "_stage", "_stg", "_tmp", "_temp", "_bkp",
+                         "_log", "_purge", "_arch", "_hist", "_s_gt", "_interface",
+                         "_staging", "_eff", "_ucm"]
+        for suffix in TEMP_SUFFIXES:
             if table_name_lower.endswith(suffix):
-                score -= 8
+                score -= 50
+                break
 
         # Penalize internal/system tables
         if any(prefix in table_name_lower for prefix in ["msc_bm_", "msc_hvgop_"]):
@@ -252,16 +247,14 @@ def search_tables(db, keywords: list[str]) -> list[dict]:
 
     # ---------------------------------------------------------------
     # Phase 2: Column-based boosting (boost already-found tables ONLY)
-    # Use ALL keywords (including attributes) for column matching
     # ---------------------------------------------------------------
     if scored and keywords:
         existing_ids = {s["table_id"] for s in scored}
         existing_id_list = list(existing_ids)
 
-        # Only search columns within already-found tables
         placeholders = ",".join(["?"] * len(existing_id_list))
         col_conditions = []
-        col_params = list(existing_id_list)  # table_id IN clause
+        col_params = list(existing_id_list)
         for kw in keywords:
             like_pat = f"%{kw}%"
             col_conditions.append("LOWER(c.column_name) LIKE ?")
@@ -277,27 +270,23 @@ def search_tables(db, keywords: list[str]) -> list[dict]:
         """
         col_rows = db.execute(col_sql, col_params).fetchall()
 
-        # Apply column boost
         col_boost_map = {r[0]: r[1] for r in col_rows}
         for s in scored:
             boost = col_boost_map.get(s["table_id"], 0)
-            s["score"] += boost * 2  # Moderate boost per column hit
+            s["score"] += boost * 2
 
-    # Sort by score descending and return top N
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[:MAX_TABLES]
 
 
 def fetch_columns(db, table_id: int, table_name: str) -> list[dict]:
     """Fetch columns for a given table, with PK info."""
-    # Get primary key column IDs for this table
     pk_rows = db.execute(
         "SELECT column_id FROM cached_primary_keys WHERE table_id = ?",
         [table_id]
     ).fetchall()
     pk_col_ids = {r[0] for r in pk_rows}
 
-    # Fetch columns
     limit_clause = f"LIMIT {MAX_COLUMNS_PER_TABLE}" if MAX_COLUMNS_PER_TABLE > 0 else ""
     col_rows = db.execute(f"""
         SELECT column_id, column_name, user_column_name, column_type,
@@ -333,7 +322,6 @@ def infer_joins(db, tables: list[dict]) -> list[dict]:
     table_ids = [t["table_id"] for t in tables]
     table_id_to_name = {t["table_id"]: t["name"] for t in tables}
 
-    # Get all _ID columns for matched tables
     placeholders = ",".join(["?"] * len(table_ids))
     id_cols = db.execute(f"""
         SELECT table_id, column_name, column_id
@@ -344,12 +332,10 @@ def infer_joins(db, tables: list[dict]) -> list[dict]:
         ORDER BY table_id, column_name
     """, table_ids).fetchall()
 
-    # Group columns by name
     col_to_tables = defaultdict(list)
     for tid, cname, cid in id_cols:
         col_to_tables[cname.upper()].append((tid, cid))
 
-    # Get PK columns for all matched tables
     pk_rows = db.execute(f"""
         SELECT table_id, column_id FROM cached_primary_keys
         WHERE table_id IN ({placeholders})
@@ -363,7 +349,6 @@ def infer_joins(db, tables: list[dict]) -> list[dict]:
         if len(table_entries) < 2:
             continue
 
-        # For each pair of tables sharing this column
         for i in range(len(table_entries)):
             for j in range(i + 1, len(table_entries)):
                 tid_a, cid_a = table_entries[i]
@@ -377,13 +362,12 @@ def infer_joins(db, tables: list[dict]) -> list[dict]:
                     continue
                 seen_pairs.add(pair_key)
 
-                # Determine confidence and direction
                 a_is_pk = (tid_a, cid_a) in pk_set
                 b_is_pk = (tid_b, cid_b) in pk_set
 
                 if a_is_pk and not b_is_pk:
                     confidence = "high"
-                    left_tid, right_tid = tid_b, tid_a  # FK → PK
+                    left_tid, right_tid = tid_b, tid_a
                 elif b_is_pk and not a_is_pk:
                     confidence = "high"
                     left_tid, right_tid = tid_a, tid_b
@@ -403,7 +387,6 @@ def infer_joins(db, tables: list[dict]) -> list[dict]:
                     "confidence": confidence,
                 })
 
-    # Sort by confidence (high first)
     joins.sort(key=lambda x: 0 if x["confidence"] == "high" else 1)
     return joins
 
@@ -416,7 +399,6 @@ def validate_sql_against_metadata(db, sql_text: str, allowed_tables: list[str]) 
     tables_used = set()
     allowed_upper = {t.upper() for t in allowed_tables}
 
-    # Parse SQL
     try:
         parsed = sqlparse.parse(sql_text)
     except Exception as e:
@@ -425,10 +407,6 @@ def validate_sql_against_metadata(db, sql_text: str, allowed_tables: list[str]) 
     if not parsed:
         return {"valid": False, "errors": ["Empty SQL"], "tablesUsed": []}
 
-    # Extract table names from SQL using regex (covers FROM, JOIN patterns)
-    sql_upper = sql_text.upper()
-
-    # Pattern: FROM table_name alias, JOIN table_name alias
     table_pattern = r'(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)'
     matches = re.findall(table_pattern, sql_text, re.IGNORECASE)
 
@@ -436,9 +414,7 @@ def validate_sql_against_metadata(db, sql_text: str, allowed_tables: list[str]) 
         tname_upper = tname.upper()
         tables_used.add(tname_upper)
 
-        # Check against allowed tables
         if tname_upper not in allowed_upper:
-            # Check if it exists in metadata at all
             exists = db.execute(
                 "SELECT COUNT(*) FROM cached_tables WHERE UPPER(table_name) = ?",
                 [tname_upper]
@@ -455,12 +431,9 @@ def validate_sql_against_metadata(db, sql_text: str, allowed_tables: list[str]) 
                     f"This is a hallucinated table name."
                 )
 
-    # Validate columns for known tables
-    # Extract column references (simplified — column_name or alias.column_name)
     col_pattern = r'(?:SELECT|WHERE|AND|OR|ON|BY|,)\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)'
     col_matches = re.findall(col_pattern, sql_text, re.IGNORECASE)
 
-    # Filter out SQL keywords and function names
     sql_keywords = {
         "SELECT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "OUTER",
         "CROSS", "ON", "AND", "OR", "NOT", "IN", "EXISTS", "BETWEEN", "LIKE",
@@ -479,7 +452,6 @@ def validate_sql_against_metadata(db, sql_text: str, allowed_tables: list[str]) 
             continue
         if col.upper() in tables_used:
             continue
-        # Check if this column exists in any of the allowed tables
         for tname in allowed_upper:
             tid_row = db.execute(
                 "SELECT table_id FROM cached_tables WHERE UPPER(table_name) = ?",
@@ -492,8 +464,6 @@ def validate_sql_against_metadata(db, sql_text: str, allowed_tables: list[str]) 
                 ).fetchone()[0]
                 if col_exists > 0:
                     break
-        # Note: We don't error on unmatched columns because alias resolution
-        # is complex. We only flag definite table issues.
 
     return {
         "valid": len(errors) == 0,
@@ -540,7 +510,6 @@ def resolve_schema():
     try:
         db = get_db()
 
-        # 1. Extract keywords
         keywords = extract_keywords(query)
         if not keywords:
             return jsonify({
@@ -549,7 +518,6 @@ def resolve_schema():
                 "meta": {"tablesReturned": 0, "searchTerms": [], "searchMethod": "keyword"},
             })
 
-        # 2. Search tables
         matched_tables = search_tables(db, keywords)
         if not matched_tables:
             return jsonify({
@@ -558,14 +526,11 @@ def resolve_schema():
                 "meta": {"tablesReturned": 0, "searchTerms": keywords, "searchMethod": "keyword"},
             })
 
-        # 3. Fetch columns for each matched table
         for tbl in matched_tables:
             tbl["columns"] = fetch_columns(db, tbl["table_id"], tbl["name"])
 
-        # 4. Infer joins
         joins = infer_joins(db, matched_tables)
 
-        # 5. Clean up internal fields before response
         for tbl in matched_tables:
             del tbl["table_id"]
             del tbl["score"]
