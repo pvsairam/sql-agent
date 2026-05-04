@@ -1,7 +1,7 @@
 """
 Oracle Fusion Metadata REST API
 ================================
-Searches a DuckDB metadata.db (from ofrag project) and returns relevant
+Searches a DuckDB metadata.db and returns relevant
 Oracle Fusion table/column/join metadata for SQL generation.
 
 Endpoints:
@@ -12,6 +12,7 @@ Endpoints:
 
 import os
 import re
+import logging
 import functools
 from collections import defaultdict
 
@@ -24,6 +25,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 API_KEY = os.getenv("API_KEY", "change-me-to-a-strong-random-key")
@@ -32,7 +42,7 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", 5000))
 
 # Search tuning
-MAX_TABLES = 10          # Maximum tables to return
+MAX_TABLES = 15             # Maximum tables to return (increased from 10)
 MAX_COLUMNS_PER_TABLE = 50  # Maximum columns per table (0 = all)
 DESCRIPTION_TRUNCATE = 200  # Truncate descriptions to this length
 
@@ -158,8 +168,8 @@ def search_tables(db, keywords: list[str]) -> list[dict]:
         "creation", "update", "last", "first", "start", "end",
     }
     entity_keywords = [kw for kw in keywords if kw not in ATTRIBUTE_WORDS]
-    attribute_keywords = [kw for kw in keywords if kw in ATTRIBUTE_WORDS]
 
+    # If ALL keywords are attributes, use them all for table search anyway
     search_keywords = entity_keywords if entity_keywords else keywords
 
     # ---------------------------------------------------------------
@@ -182,9 +192,10 @@ def search_tables(db, keywords: list[str]) -> list[dict]:
         FROM cached_tables t
         WHERE ({where})
           AND t.status = 'Active'
-        LIMIT 500
+        LIMIT 1000
     """
     rows = db.execute(sql, params).fetchall()
+    logger.info(f"Phase 1 search found {len(rows)} candidate tables for keywords: {search_keywords}")
 
     # Score each table
     scored = []
@@ -198,16 +209,19 @@ def search_tables(db, keywords: list[str]) -> list[dict]:
         # Count how many ENTITY keywords match (relevance indicator)
         entity_matches = 0
         for kw in search_keywords:
+            # Table name exact substring match (highest weight)
             if kw in table_name_lower:
                 score += 15
                 entity_matches += 1
+            # User-friendly name match
             if kw in user_name_lower:
                 score += 8
                 entity_matches += 1
+            # Description match
             if kw in desc_lower:
                 score += 3
 
-        # Bonus for matching MULTIPLE entity keywords
+        # Bonus for matching MULTIPLE entity keywords (cross-concept relevance)
         if entity_matches >= 2:
             score += entity_matches * 5
 
@@ -215,15 +229,22 @@ def search_tables(db, keywords: list[str]) -> list[dict]:
         if ttype == "T":
             score += 2
 
-        # Prefer non-audit tables
+        # Boost canonical Oracle base tables — _ALL suffix tables are always
+        # the real production tables across every Oracle Fusion pillar
+        if table_name_lower.endswith("_all"):
+            score += 20
+
+        # Prefer non-audit tables (tables ending in bare underscore are audit variants)
         if not table_name_lower.endswith("_"):
             score += 2
 
-        # Penalize staging, temp, backup, and interface tables
-        # Penalty is -50 so these always drop below 0 and get filtered out
-        TEMP_SUFFIXES = ["_gt", "_int", "_stage", "_stg", "_tmp", "_temp", "_bkp",
-                         "_log", "_purge", "_arch", "_hist", "_s_gt", "_interface",
-                         "_staging", "_eff", "_ucm"]
+        # Penalize staging, temp, backup, interface, and variant tables
+        # Penalty is -50 so these always drop below 0 and get filtered out by the score > 0 check
+        TEMP_SUFFIXES = [
+            "_gt", "_int", "_stage", "_stg", "_tmp", "_temp", "_bkp",
+            "_log", "_purge", "_arch", "_hist", "_s_gt", "_interface",
+            "_staging", "_eff", "_ucm", "_pii_", "_denied_parties_",
+        ]
         for suffix in TEMP_SUFFIXES:
             if table_name_lower.endswith(suffix):
                 score -= 50
@@ -247,6 +268,7 @@ def search_tables(db, keywords: list[str]) -> list[dict]:
 
     # ---------------------------------------------------------------
     # Phase 2: Column-based boosting (boost already-found tables ONLY)
+    # Use ALL keywords (including attributes) for column matching
     # ---------------------------------------------------------------
     if scored and keywords:
         existing_ids = {s["table_id"] for s in scored}
@@ -276,7 +298,9 @@ def search_tables(db, keywords: list[str]) -> list[dict]:
             s["score"] += boost * 2
 
     scored.sort(key=lambda x: x["score"], reverse=True)
-    return scored[:MAX_TABLES]
+    top = scored[:MAX_TABLES]
+    logger.info(f"Returning top {len(top)} tables: {[t['name'] for t in top]}")
+    return top
 
 
 def fetch_columns(db, table_id: int, table_name: str) -> list[dict]:
@@ -322,11 +346,12 @@ def infer_joins(db, tables: list[dict]) -> list[dict]:
     table_ids = [t["table_id"] for t in tables]
     table_id_to_name = {t["table_id"]: t["name"] for t in tables}
 
-    placeholders = ",".join(["?"] * len(table_ids))
+    placeholders_t = ",".join(["?"] * len(table_ids))
+
     id_cols = db.execute(f"""
         SELECT table_id, column_name, column_id
         FROM cached_columns
-        WHERE table_id IN ({placeholders})
+        WHERE table_id IN ({placeholders_t})
           AND (LOWER(column_name) LIKE '%\\_id' ESCAPE '\\'
                OR LOWER(column_name) LIKE '%\\_code' ESCAPE '\\')
         ORDER BY table_id, column_name
@@ -338,7 +363,7 @@ def infer_joins(db, tables: list[dict]) -> list[dict]:
 
     pk_rows = db.execute(f"""
         SELECT table_id, column_id FROM cached_primary_keys
-        WHERE table_id IN ({placeholders})
+        WHERE table_id IN ({placeholders_t})
     """, table_ids).fetchall()
     pk_set = {(r[0], r[1]) for r in pk_rows}
 
@@ -393,7 +418,9 @@ def infer_joins(db, tables: list[dict]) -> list[dict]:
 
 def validate_sql_against_metadata(db, sql_text: str, allowed_tables: list[str]) -> dict:
     """
-    Parse SQL and validate that all tables/columns exist in metadata.
+    Parse SQL and validate that all tables exist in metadata.
+    When allowedTables is empty, validates only that tables exist in metadata.db.
+    When allowedTables is provided, also checks tables were in the schema context.
     """
     errors = []
     tables_used = set()
@@ -407,6 +434,7 @@ def validate_sql_against_metadata(db, sql_text: str, allowed_tables: list[str]) 
     if not parsed:
         return {"valid": False, "errors": ["Empty SQL"], "tablesUsed": []}
 
+    # Extract table names from SQL (covers FROM and JOIN patterns)
     table_pattern = r'(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)'
     matches = re.findall(table_pattern, sql_text, re.IGNORECASE)
 
@@ -415,55 +443,66 @@ def validate_sql_against_metadata(db, sql_text: str, allowed_tables: list[str]) 
         tables_used.add(tname_upper)
 
         if tname_upper not in allowed_upper:
+            # Check if it exists in metadata at all
             exists = db.execute(
                 "SELECT COUNT(*) FROM cached_tables WHERE UPPER(table_name) = ?",
                 [tname_upper]
             ).fetchone()[0]
 
             if exists:
-                errors.append(
-                    f"Table '{tname_upper}' exists in metadata but was not in the "
-                    f"provided schema context. It may be relevant — consider adding it."
-                )
+                # If no allowedTables whitelist was provided, a table existing
+                # in metadata is GOOD — the LLM used a real Oracle Fusion table.
+                # Only flag it when a whitelist was explicitly provided.
+                if allowed_tables:
+                    errors.append(
+                        f"Table '{tname_upper}' exists in metadata but was not in the "
+                        f"provided schema context. It may be relevant — consider adding it."
+                    )
+                # else: table exists in metadata, no whitelist = valid, do nothing
             else:
+                # Table does not exist at all — this is a hallucinated table name
                 errors.append(
                     f"Table '{tname_upper}' does NOT exist in Oracle Fusion metadata. "
                     f"This is a hallucinated table name."
                 )
 
-    col_pattern = r'(?:SELECT|WHERE|AND|OR|ON|BY|,)\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)'
-    col_matches = re.findall(col_pattern, sql_text, re.IGNORECASE)
+    # Validate columns only when a whitelist is provided
+    if allowed_tables:
+        col_pattern = r'(?:SELECT|WHERE|AND|OR|ON|BY|,)\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)'
+        col_matches = re.findall(col_pattern, sql_text, re.IGNORECASE)
 
-    sql_keywords = {
-        "SELECT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "OUTER",
-        "CROSS", "ON", "AND", "OR", "NOT", "IN", "EXISTS", "BETWEEN", "LIKE",
-        "IS", "NULL", "AS", "ORDER", "BY", "GROUP", "HAVING", "UNION", "ALL",
-        "DISTINCT", "CASE", "WHEN", "THEN", "ELSE", "END", "COUNT", "SUM",
-        "AVG", "MIN", "MAX", "NVL", "NVL2", "DECODE", "TRIM", "UPPER", "LOWER",
-        "TO_CHAR", "TO_DATE", "TO_NUMBER", "SYSDATE", "TRUNC", "ROUND", "ASC",
-        "DESC", "FETCH", "FIRST", "NEXT", "ROWS", "ONLY", "OFFSET", "LIMIT",
-        "COALESCE", "CAST", "SUBSTR", "LENGTH", "REPLACE", "INSTR", "CONCAT",
-        "ROWNUM", "ROWID", "DUAL", "WITH", "RECURSIVE", "INSERT", "UPDATE",
-        "DELETE", "VALUES", "SET", "INTO",
-    }
+        sql_keywords = {
+            "SELECT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "OUTER",
+            "CROSS", "ON", "AND", "OR", "NOT", "IN", "EXISTS", "BETWEEN", "LIKE",
+            "IS", "NULL", "AS", "ORDER", "BY", "GROUP", "HAVING", "UNION", "ALL",
+            "DISTINCT", "CASE", "WHEN", "THEN", "ELSE", "END", "COUNT", "SUM",
+            "AVG", "MIN", "MAX", "NVL", "NVL2", "DECODE", "TRIM", "UPPER", "LOWER",
+            "TO_CHAR", "TO_DATE", "TO_NUMBER", "SYSDATE", "TRUNC", "ROUND", "ASC",
+            "DESC", "FETCH", "FIRST", "NEXT", "ROWS", "ONLY", "OFFSET", "LIMIT",
+            "COALESCE", "CAST", "SUBSTR", "LENGTH", "REPLACE", "INSTR", "CONCAT",
+            "ROWNUM", "ROWID", "DUAL", "WITH", "RECURSIVE", "INSERT", "UPDATE",
+            "DELETE", "VALUES", "SET", "INTO",
+        }
 
-    for col in col_matches:
-        if col.upper() in sql_keywords:
-            continue
-        if col.upper() in tables_used:
-            continue
-        for tname in allowed_upper:
-            tid_row = db.execute(
-                "SELECT table_id FROM cached_tables WHERE UPPER(table_name) = ?",
-                [tname]
-            ).fetchone()
-            if tid_row:
-                col_exists = db.execute(
-                    "SELECT COUNT(*) FROM cached_columns WHERE table_id = ? AND UPPER(column_name) = ?",
-                    [tid_row[0], col.upper()]
-                ).fetchone()[0]
-                if col_exists > 0:
-                    break
+        for col in col_matches:
+            if col.upper() in sql_keywords:
+                continue
+            if col.upper() in tables_used:
+                continue
+            for tname in allowed_upper:
+                tid_row = db.execute(
+                    "SELECT table_id FROM cached_tables WHERE UPPER(table_name) = ?",
+                    [tname]
+                ).fetchone()
+                if tid_row:
+                    col_exists = db.execute(
+                        "SELECT COUNT(*) FROM cached_columns WHERE table_id = ? AND UPPER(column_name) = ?",
+                        [tid_row[0], col.upper()]
+                    ).fetchone()[0]
+                    if col_exists > 0:
+                        break
+
+    logger.info(f"Validation result: valid={len(errors) == 0}, tables={list(tables_used)}, errors={errors}")
 
     return {
         "valid": len(errors) == 0,
@@ -489,6 +528,7 @@ def health():
             "columnsCount": col_count,
         })
     except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
@@ -506,6 +546,8 @@ def resolve_schema():
     query = body["query"].strip()
     if not query:
         return jsonify({"error": "'query' must not be empty."}), 400
+
+    logger.info(f"resolve-schema called with query: {query}")
 
     try:
         db = get_db()
@@ -546,6 +588,7 @@ def resolve_schema():
         })
 
     except Exception as e:
+        logger.error(f"resolve-schema error: {str(e)}")
         return jsonify({"error": f"Internal error: {str(e)}"}), 500
 
 
@@ -566,11 +609,14 @@ def validate_sql():
     if not sql_text:
         return jsonify({"error": "'sql' must not be empty."}), 400
 
+    logger.info(f"validate-sql called, allowedTables count: {len(allowed_tables)}")
+
     try:
         db = get_db()
         result = validate_sql_against_metadata(db, sql_text, allowed_tables)
         return jsonify(result)
     except Exception as e:
+        logger.error(f"validate-sql error: {str(e)}")
         return jsonify({"error": f"Validation error: {str(e)}"}), 500
 
 
@@ -578,6 +624,6 @@ def validate_sql():
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print(f"Starting Oracle Fusion Metadata API on {HOST}:{PORT}")
-    print(f"Database: {METADATA_DB_PATH}")
+    logger.info(f"Starting Oracle Fusion Metadata API on {HOST}:{PORT}")
+    logger.info(f"Database: {METADATA_DB_PATH}")
     app.run(host=HOST, port=PORT, debug=False)
